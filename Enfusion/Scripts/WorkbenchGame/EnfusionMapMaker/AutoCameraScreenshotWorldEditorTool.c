@@ -12,7 +12,7 @@ class AutoCameraScreenshotWorldEditorTool: WorldEditorTool
 	// otherwise!
 
 	// The camera will start at m_StartCoords and step by m_StepSize
-	// in each axis until it reaches m_EndCoordsX, generating
+	// in each axis until it reaches m_EndCoords, generating
 	// screenshots into your $profile directory, which is usually
 	// C:\Users\<NAME>\Documents\My Games\ArmaReforgerWorkbench\profile\
 
@@ -32,11 +32,17 @@ class AutoCameraScreenshotWorldEditorTool: WorldEditorTool
 	// During capture, the escape key will allow you to stop the process,
 	// because you cannot access the button if the editor camera is full screen!
 
+	// Camera looks straight down
+	static const vector CAMERA_LOOK_DOWN = Vector(0, -90, 0);
 	
-	[Attribute("200 0 200", UIWidgets.Coords, "Camera start", "", null, "Camera")]
+	//------------------------------------------------------------
+	// Camera settings
+	//------------------------------------------------------------
+
+	[Attribute("200 0 200", UIWidgets.Coords, "Camera start position", "", null, "Camera")]
 	vector m_StartCoords;
 	
-	[Attribute("12800 0 12800", UIWidgets.Coords, "Camera end", "", null, "Camera")]
+	[Attribute("12800 0 12800", UIWidgets.Coords, "Camera end position", "", null, "Camera")]
 	vector m_EndCoords;
 	
 	[Attribute("950", UIWidgets.Auto, "Camera height", "", null, "Camera")]
@@ -45,45 +51,81 @@ class AutoCameraScreenshotWorldEditorTool: WorldEditorTool
 	[Attribute("0", UIWidgets.CheckBox, "Camera height is absolute, not relative to terrain height", "", null, "Camera")]
 	bool m_AbsoluteCameraHeight;
 
-	[Attribute("100", UIWidgets.Auto, "Camera step size", "", null, "Camera")]
+	[Attribute("100", UIWidgets.Auto, "Camera step size (must be > 0)", "", null, "Camera")]
 	int m_StepSize;
 
 	[Attribute("15", UIWidgets.Auto, "Camera FOV", "", null, "Camera")]
-	float m_fieldOfView;
+	float m_FieldOfView;
+
+	//------------------------------------------------------------
+	// Timing
+	//------------------------------------------------------------
 
 	[Attribute("700", UIWidgets.Auto, "Sleep after incremental camera movement (ms)", "", null, "Timing")]
 	float m_MoveSleep;
 
-	[Attribute("2000", UIWidgets.Auto, "Sleep after a large amount of camera movement (ms)", "", null, "Timing")]
+	[Attribute("2000", UIWidgets.Auto, "Sleep after a large / discontinuous camera movement (ms)", "", null, "Timing")]
 	float m_DiscontinuousMoveSleep;
 
 	[Attribute("200", UIWidgets.Auto, "Sleep after screenshot call (ms)", "", null, "Timing")]
 	float m_ScreenshotSleep;
 	
-	[Attribute("mapoutput", UIWidgets.Auto, "Output filename predix", "", null, "Screenshot output")]
-	string m_outputDirectory;
+	//------------------------------------------------------------
+	// Screenshot output
+	//------------------------------------------------------------
+
+	[Attribute("mapoutput", UIWidgets.Auto, "Output directory name", "", null, "Screenshot output")]
+	string m_OutputDirectory;
 	
-	[Attribute("eden", UIWidgets.Auto, "Output filename predix", "", null, "Screenshot output")]
-	string m_outputFilePrefix;
+	[Attribute("eden", UIWidgets.Auto, "Output filename prefix", "", null, "Screenshot output")]
+	string m_OutputFilePrefix;
+
+	//------------------------------------------------------------
+	// Advanced
+	//------------------------------------------------------------
 
 	[Attribute("_tile.png", UIWidgets.Auto, "Tile filename suffix (must match the python code)", "", null, "Advanced")]
-	string m_tileFilenameSuffix;
+	string m_TileFilenameSuffix;
 
-	[Attribute("0.025", UIWidgets.Auto, "Sleep after incremental camera movement (ms)", "", null, "Advanced")]
-	float m_hdrBrightness;
+	[Attribute("0.025", UIWidgets.Auto, "Custom HDR brightness override (-1 to reset)", "", null, "Advanced")]
+	float m_HdrBrightness;
 
-	// Loop state
+	//------------------------------------------------------------
+	// Cached refs & loop state
+	//------------------------------------------------------------
+
+	private WorldEditorAPI m_Api;
 	private bool m_InCaptureLoop;
 	private bool m_CancelCurrentLoop;
 	
+	//------------------------------------------------------------
+	// Editor ref helpers
+	//------------------------------------------------------------
+
+	private WorldEditorAPI GetApi()
+	{
+		if (!m_Api)
+		{
+			WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
+			m_Api = worldEditor.GetApi();
+		}
+		return m_Api;
+	}
+
+	//------------------------------------------------------------
+	// Buttons
+	//------------------------------------------------------------
+
 	[ButtonAttribute("Move to start")]
-	void PositionCameraStart() {
+	void PositionCameraStart()
+	{
 		ApplyCameraSettings();
 		MoveCamera(m_StartCoords[0], m_StartCoords[2], m_CameraHeight, m_AbsoluteCameraHeight);
 	}
 	
 	[ButtonAttribute("Move to end")]
-	void PositionCameraEnd() {
+	void PositionCameraEnd()
+	{
 		ApplyCameraSettings();
 		MoveCamera(m_EndCoords[0], m_EndCoords[2], m_CameraHeight, m_AbsoluteCameraHeight);
 	}
@@ -91,197 +133,242 @@ class AutoCameraScreenshotWorldEditorTool: WorldEditorTool
 	[ButtonAttribute("Stop Capture")]
 	void StopCapture()
 	{
-		if (m_InCaptureLoop) {
-			if (m_CancelCurrentLoop) {
-				Print("Halt in progress");
-			} else {
-				m_CancelCurrentLoop = true;
+		if (m_InCaptureLoop)
+		{
+			if (m_CancelCurrentLoop)
+			{
+				Print("Halt already in progress");
 			}
-			Print("Halting capture loop ...");
-		} else {
+			else
+			{
+				m_CancelCurrentLoop = true;
+				Print("Halting capture loop ...");
+			}
+		}
+		else
+		{
 			Print("No capture loop running");
-			// Reset the camera in any case
 			ResetCustomHDRBrightness();
 		}
 	}
 	
-	// Delete all button
 	[ButtonAttribute("Start Capture")]
-	void StartCapture()	
+	void StartCapture()
 	{
-		if (m_InCaptureLoop) {
+		if (m_InCaptureLoop)
+		{
 			Print("Capture loop already in progress");
 			return;
 		}
 		
+		// Validate step size
+		if (m_StepSize <= 0)
+		{
+			Print("ERROR: StepSize must be greater than 0!");
+			return;
+		}
+		
+		// Validate coordinate ranges
+		int xDistance = m_EndCoords[0] - m_StartCoords[0];
+		int zDistance = m_EndCoords[2] - m_StartCoords[2];
+		
+		if (xDistance <= 0 || zDistance <= 0)
+		{
+			PrintFormat("ERROR: End coords must be greater than start coords (xDist=%1, zDist=%2)", xDistance, zDistance);
+			return;
+		}
+		
+		int stepCountX = xDistance / m_StepSize;
+		int stepCountZ = zDistance / m_StepSize;
+		int totalTiles = stepCountX * stepCountZ;
+
+		PrintFormat("Capture plan: %1 x %2 = %3 tiles, step size %4", stepCountX, stepCountZ, totalTiles, m_StepSize);
+
 		m_InCaptureLoop = true;
 		m_CancelCurrentLoop = false;
 		
 		Print("Performing initial camera move");
 		MoveCamera(m_StartCoords[0], m_StartCoords[2], m_CameraHeight, m_AbsoluteCameraHeight);
 
-		for (int i = 0; i < 5; i++) {
-			Print("Starting capture in " + (5 - i) + " seconds");
+		for (int i = 0; i < 5; i++)
+		{
+			PrintFormat("Starting capture in %1 seconds ...", 5 - i);
 			Sleep(1000);
 
-			// Early out here after the sleep, in case the user already aborted the loop
-			if (m_CancelCurrentLoop) {
+			if (m_CancelCurrentLoop)
+			{
 				m_InCaptureLoop = false;
-				Print("Capture loop aborted");
+				Print("Capture loop aborted during countdown");
 				return;
 			}
 		}
 		
-		int xDistance = m_EndCoords[0] - m_StartCoords[0];
-		int zDistance = m_EndCoords[2] - m_StartCoords[2];
-		
-		int stepCountX = xDistance / m_StepSize;
-		int stepCountZ = zDistance / m_StepSize;
-		
-		Print("Starting capture loop");
 		DoLoop(m_StartCoords[0], m_StartCoords[2], m_StepSize, m_CameraHeight, stepCountX, stepCountZ);
-		Print("Finished capture");
+		PrintFormat("Capture finished (%1 total tiles)", totalTiles);
 	}
 	
 	override void OnDeActivate()
 	{
 		m_CancelCurrentLoop = true;
+		m_Api = null;
 	}
 	
-	// We loop over Z inside X, so we travel vertically in strips, slowly crossing right. Z is North, X is East.
-	void DoLoop(int initialX, int initialZ, int stepSize, int camHeight, int stepCountX, int stepCountZ) {		
-		string outputDirectory = "$profile:" + m_outputDirectory;
-		PrintFormat("Making directory %1", outputDirectory);
+	//------------------------------------------------------------
+	// Core capture loop
+	//------------------------------------------------------------
+
+	// We loop over Z inside X, so we travel vertically in strips, slowly crossing right.
+	// Z is North, X is East.
+	void DoLoop(int initialX, int initialZ, int stepSize, int camHeight, int stepCountX, int stepCountZ)
+	{
+		string outputDirectory = "$profile:" + m_OutputDirectory;
+		
+		if (!FileIO.MakeDirectory(outputDirectory))
+		{
+			PrintFormat("WARNING: MakeDirectory failed for %1 (may already exist)", outputDirectory);
+		}
 		
 		bool cameraDiscontinuousMovement = false;
+		int totalTiles = stepCountX * stepCountZ;
+		int currentTile = 0;
+		int skippedTiles = 0;
 
-		bool done = false;
-		
 		// Set up camera parameters
 		ApplyCameraSettings();
 
-		for (int x = 0; x < stepCountX; x++) {
+		for (int x = 0; x < stepCountX; x++)
+		{
 			float mapPositionX = initialX + (x * stepSize);
 			int intMapPositionX = mapPositionX;
 			
 			// We use the x coordinate for the output directory structure
 			string xCoordinateDir = outputDirectory + "/" + string.Format("%1", intMapPositionX) + "/";
-			PrintFormat("Making directory %1", xCoordinateDir);
-			FileIO.MakeDirectory(xCoordinateDir);
 			
-			cameraDiscontinuousMovement = true; // this happens after each loop
+			if (!FileIO.MakeDirectory(xCoordinateDir))
+			{
+				PrintFormat("WARNING: MakeDirectory failed for %1 (may already exist)", xCoordinateDir);
+			}
+			
+			cameraDiscontinuousMovement = true;
 
-			for (int z = 0; z < stepCountZ; z++) {
+			for (int z = 0; z < stepCountZ; z++)
+			{
+				currentTile++;
 				float mapPositionZ = initialZ + (z * stepSize);
 				int intMapPositionZ = mapPositionZ;
 				
-				// Make the output hashdir structure first
-				string outputPath = xCoordinateDir + m_outputFilePrefix + "_" + intMapPositionX + "_" + intMapPositionZ; // it will automatically add .png
+				// Build output paths
+				string outputPath = xCoordinateDir + m_OutputFilePrefix + "_" + intMapPositionX + "_" + intMapPositionZ;
 				string outputPathWithSuffix = outputPath + ".png";
 				
-				if (FileIO.FileExist(outputPathWithSuffix)) {
-					PrintFormat("Screenshot already exists at %1", outputPathWithSuffix);
-					cameraDiscontinuousMovement = true; // we have broken the incremental movements
+				// Skip if raw screenshot already exists
+				if (FileIO.FileExist(outputPathWithSuffix))
+				{
+					skippedTiles++;
+					cameraDiscontinuousMovement = true;
 					continue;
 				}
 			
-				// check for the cropped tile version
-				string tilePath = outputPath + m_tileFilenameSuffix;
-				if (FileIO.FileExist(tilePath)) {
-					// Skip!
-					PrintFormat("Skipping completed tile %1", tilePath);
-					cameraDiscontinuousMovement = true; // we have broken the incremental movements
+				// Skip if cropped tile already exists
+				string tilePath = outputPath + m_TileFilenameSuffix;
+				if (FileIO.FileExist(tilePath))
+				{
+					skippedTiles++;
+					cameraDiscontinuousMovement = true;
 					continue;
-				} else {
-					PrintFormat("No existing tile found at %1", tilePath);
 				}
 				
-				PrintFormat("Moving to x=%1/%2, z=%3/%4", x, stepCountX, z, stepCountZ);
+				// Progress report
+				int percent = (currentTile * 100) / totalTiles;
+				PrintFormat("[%1/%2] (%3%%) Capturing x=%4 z=%5", currentTile, totalTiles, percent, intMapPositionX, intMapPositionZ);
+				
 				MoveCamera(mapPositionX, mapPositionZ, camHeight, m_AbsoluteCameraHeight);
-				if (cameraDiscontinuousMovement) {
+				
+				if (cameraDiscontinuousMovement)
+				{
 					Sleep(m_DiscontinuousMoveSleep);
 					cameraDiscontinuousMovement = false;
-				} else {
+				}
+				else
+				{
 					Sleep(m_MoveSleep);
 				}
 				
-				// Now create the screenshot
-				PrintFormat("Writing PNG to %1", outputPath);
+				// Take the screenshot
 				bool success = System.MakeScreenshot(outputPath);
-				if (!success) {
-					Print("Failed to write screenshot");
+				if (!success)
+				{
+					PrintFormat("ERROR: Failed to write screenshot at %1", outputPath);
 					m_CancelCurrentLoop = true;
 				}
-				// Wait for the screenshot to write
+				
 				Sleep(m_ScreenshotSleep);
 
-				// Break if we've been asked to				
-				if (m_CancelCurrentLoop) {
+				if (m_CancelCurrentLoop)
 					break;
-				}
 			}
 			
-			// Break if we've been asked to				
-			if (m_CancelCurrentLoop) {
+			if (m_CancelCurrentLoop)
 				break;
-			}			
 		}
 		
-		// Move the camera back to the initial position
+		// Summary
+		int capturedTiles = currentTile - skippedTiles;
+		PrintFormat("Capture complete: %1 captured, %2 skipped, %3 total", capturedTiles, skippedTiles, totalTiles);
+
+		// Reset camera and HDR
 		MoveCamera(initialX, initialZ, camHeight, m_AbsoluteCameraHeight);
-
-		// Reinstate auto exposure
 		ResetCustomHDRBrightness();
-
 		m_InCaptureLoop = false;
 	}
 	
+	//------------------------------------------------------------
+	// Camera helpers
+	//------------------------------------------------------------
+
 	void ApplyCameraSettings()
 	{
-		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-		WorldEditorAPI api = worldEditor.GetApi();
+		WorldEditorAPI api = GetApi();
 		BaseWorld baseWorld = api.GetWorld();
-		int currentCameraId = baseWorld.GetCurrentCameraId();
-		baseWorld.SetCameraHDRBrightness(currentCameraId, m_hdrBrightness);
-		baseWorld.SetCameraVerticalFOV(currentCameraId, m_fieldOfView);
+		int cameraId = baseWorld.GetCurrentCameraId();
+		baseWorld.SetCameraHDRBrightness(cameraId, m_HdrBrightness);
+		baseWorld.SetCameraVerticalFOV(cameraId, m_FieldOfView);
 	}
 	
 	void ResetCustomHDRBrightness()
 	{
-		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-		WorldEditorAPI api = worldEditor.GetApi();
+		WorldEditorAPI api = GetApi();
 		BaseWorld baseWorld = api.GetWorld();
-		int currentCameraId = baseWorld.GetCurrentCameraId();
-		baseWorld.SetCameraHDRBrightness(currentCameraId, -1);
+		int cameraId = baseWorld.GetCurrentCameraId();
+		baseWorld.SetCameraHDRBrightness(cameraId, -1);
 	}
 	
 	void MoveCamera(float xPos, float zPos, float camHeight, bool camHeightAbsolute)
 	{
+		WorldEditorAPI api = GetApi();
+		
 		float height = 0;
-		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-		WorldEditorAPI api = worldEditor.GetApi();
 		api.TryGetTerrainSurfaceY(xPos, zPos, height);
 		
-		if (camHeightAbsolute) {
+		if (camHeightAbsolute)
 			height = camHeight;
-		} else {
+		else
 			height += camHeight;
-		}
 		
 		vector newCamPos = Vector(xPos, height, zPos);
-		vector lookVec = Vector(0, -90, 0); // Somehow the X and Y coords are different between the GUI representation and the code repr
-		api.SetCamera(newCamPos, lookVec);
+		api.SetCamera(newCamPos, CAMERA_LOOK_DOWN);
 	}
 
+	//------------------------------------------------------------
+	// Keyboard input
+	//------------------------------------------------------------
 	
-	// Method called on keyboard key press
 	override void OnKeyPressEvent(KeyCode key, bool isAutoRepeat)
 	{
-		// Abort on esc
-		if (key == KeyCode.KC_ESCAPE && isAutoRepeat == false && m_InCaptureLoop && m_CancelCurrentLoop == false)
+		if (key == KeyCode.KC_ESCAPE && !isAutoRepeat && m_InCaptureLoop && !m_CancelCurrentLoop)
 		{
 			m_CancelCurrentLoop = true;
-		}		
+			Print("Escape pressed — halting capture ...");
+		}
 	}
-
 }
