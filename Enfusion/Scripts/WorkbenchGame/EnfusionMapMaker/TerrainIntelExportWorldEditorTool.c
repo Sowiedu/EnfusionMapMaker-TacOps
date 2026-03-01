@@ -3,7 +3,7 @@
 	description: "Export terrain intelligence data (heightmap, roads, forests, water, landmarks, metadata) for TacOps.",
 	wbModules: {"WorldEditor"},
 	awesomeFontCode: 0xf0ac)]
-class TerrainIntelExportWorldEditorTool: WorldEditorTool
+class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 {
 	// Unified terrain intelligence export tool.
 	// Exports the following layers to $profile:<mapName>/intel/:
@@ -18,9 +18,6 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 	// State
 	//------------------------------------------------------------
 
-	private WorldEditorAPI m_Api;
-	private bool m_InExportLoop;
-	private bool m_CancelExport;
 	private string m_MapName;
 	private string m_OutputDir;
 	private string m_WorldPath;
@@ -39,27 +36,13 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 	private int m_LandmarkCount;
 
 	//------------------------------------------------------------
-	// Cached API access
-	//------------------------------------------------------------
-
-	private WorldEditorAPI GetApi()
-	{
-		if (!m_Api)
-		{
-			WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-			m_Api = worldEditor.GetApi();
-		}
-		return m_Api;
-	}
-
-	//------------------------------------------------------------
 	// Shared: Initialization
 	//------------------------------------------------------------
 
 	//! Validate API and world are loaded, set up map name and output dir
 	private bool InitExport()
 	{
-		if (m_InExportLoop)
+		if (IsRunning())
 		{
 			Print("Export already in progress");
 			return false;
@@ -87,15 +70,14 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 		FileIO.MakeDirectory("$profile:" + m_MapName);
 		FileIO.MakeDirectory(m_OutputDir);
 
-		m_InExportLoop = true;
-		m_CancelExport = false;
+		BeginOperation();
 
 		return true;
 	}
 
 	private void FinishExport()
 	{
-		m_InExportLoop = false;
+		EndOperation();
 	}
 
 	//------------------------------------------------------------
@@ -374,7 +356,7 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 
 			ReportProgress(samplesWritten, totalSamples, "Heightmap");
 
-			if (m_CancelExport)
+			if (IsCancelled())
 			{
 				Print("Heightmap export cancelled");
 				binFile.Close();
@@ -485,7 +467,7 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 
 		for (int i = 0; i < entityCount; i++)
 		{
-			if (m_CancelExport)
+			if (IsCancelled())
 				break;
 
 			IEntitySource entSrc = api.GetEditorEntity(i);
@@ -551,7 +533,7 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 			PrintFormat("  Landmarks: %1 features → landmarks.geojson", m_LandmarkCount);
 		}
 
-		if (m_CancelExport)
+		if (IsCancelled())
 			Print("Entity export cancelled by user");
 	}
 
@@ -769,15 +751,15 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 		PrintFormat("  Output: %1", m_OutputDir);
 
 		// Layer 0: Heightmap
-		if (!m_CancelExport)
+		if (!IsCancelled())
 			DoHeightmapExport();
 
 		// Layers 1-4: Single-pass entity scan
-		if (!m_CancelExport)
+		if (!IsCancelled())
 			ExportEntityLayers(true, true, true, true);
 
 		// Layer 5: Metadata
-		if (!m_CancelExport)
+		if (!IsCancelled())
 			ExportMetadata();
 
 		PrintFormat("=== Export Complete ===");
@@ -853,37 +835,6 @@ class TerrainIntelExportWorldEditorTool: WorldEditorTool
 	[ButtonAttribute("Cancel Export")]
 	void BtnCancelExport()
 	{
-		if (m_InExportLoop)
-		{
-			m_CancelExport = true;
-			Print("Cancelling export ...");
-		}
-		else
-		{
-			Print("No export in progress");
-		}
-	}
-
-	//------------------------------------------------------------
-	// Lifecycle
-	//------------------------------------------------------------
-
-	override void OnDeActivate()
-	{
-		m_CancelExport = true;
-		m_Api = null;
-	}
-
-	//------------------------------------------------------------
-	// Keyboard input
-	//------------------------------------------------------------
-
-	override void OnKeyPressEvent(KeyCode key, bool isAutoRepeat)
-	{
-		if (key == KeyCode.KC_ESCAPE && !isAutoRepeat && m_InExportLoop && !m_CancelExport)
-		{
-			m_CancelExport = true;
-			Print("Escape pressed — cancelling export ...");
-		}
+		RequestCancel();
 	}
 }
