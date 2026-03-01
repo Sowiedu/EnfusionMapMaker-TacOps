@@ -36,8 +36,11 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 	[Attribute("100", UIWidgets.Auto, "Camera step size (must be > 0)", "", null, "Camera")]
 	int m_StepSize;
 
-	[Attribute("15", UIWidgets.Auto, "Camera FOV", "", null, "Camera")]
+	[Attribute("15", UIWidgets.Auto, "Camera FOV (in ortho mode this controls vertical extent in world units)", "", null, "Camera")]
 	float m_FieldOfView;
+
+	[Attribute("0", UIWidgets.CheckBox, "Use orthographic projection (eliminates perspective distortion for perfect tile stitching)", "", null, "Camera")]
+	bool m_UseOrthographic;
 
 	//------------------------------------------------------------
 	// Timing
@@ -157,7 +160,7 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 		else
 		{
 			Print("No capture loop running");
-			ResetCustomHDRBrightness();
+			ResetCameraSettings();
 		}
 	}
 	
@@ -204,9 +207,15 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 		}
 
 		// FOV check
-		if (m_FieldOfView != 15)
+		if (!m_UseOrthographic && m_FieldOfView != 15)
 		{
 			PrintFormat("WARNING: FOV is set to %1 — the default tile pipeline expects FOV=15. Tiles may not align correctly.", m_FieldOfView);
+		}
+
+		if (m_UseOrthographic)
+		{
+			PrintFormat("=== ORTHOGRAPHIC MODE: perspective distortion eliminated ===");
+			PrintFormat("  FOV value (%1) controls vertical extent in world units", m_FieldOfView);
 		}
 
 		int stepCountX = xDistance / m_StepSize;
@@ -411,7 +420,7 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 
 		// Reset camera and HDR
 		MoveCamera(initialX, initialZ, camHeight, m_AbsoluteCameraHeight);
-		ResetCustomHDRBrightness();
+		ResetCameraSettings();
 		EndOperation();
 	}
 	
@@ -527,6 +536,8 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 				int camIdx = b + 1;
 				baseWorld.SetCamera(camIdx, tilePos, CAMERA_LOOK_DOWN);
 				baseWorld.SetCameraVerticalFOV(camIdx, m_FieldOfView);
+				if (m_UseOrthographic)
+					baseWorld.SetCameraType(camIdx, CameraType.ORTHOGRAPHIC);
 
 				// Trigger terrain/LOD pre-streaming
 				baseWorld.SchedulePreload(tilePos, m_PreloadRadius);
@@ -611,7 +622,7 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 
 		// Reset camera and HDR
 		MoveCamera(initialX, initialZ, camHeight, m_AbsoluteCameraHeight);
-		ResetCustomHDRBrightness();
+		ResetCameraSettings();
 		EndOperation();
 	}
 
@@ -626,14 +637,17 @@ class AutoCameraScreenshotWorldEditorTool: BaseMapMakerTool
 		int cameraId = baseWorld.GetCurrentCameraId();
 		baseWorld.SetCameraHDRBrightness(cameraId, m_HdrBrightness);
 		baseWorld.SetCameraVerticalFOV(cameraId, m_FieldOfView);
+		if (m_UseOrthographic)
+			baseWorld.SetCameraType(cameraId, CameraType.ORTHOGRAPHIC);
 	}
 	
-	void ResetCustomHDRBrightness()
+	void ResetCameraSettings()
 	{
 		WorldEditorAPI api = GetApi();
 		BaseWorld baseWorld = api.GetWorld();
 		int cameraId = baseWorld.GetCurrentCameraId();
 		baseWorld.SetCameraHDRBrightness(cameraId, -1);
+		baseWorld.SetCameraType(cameraId, CameraType.PERSPECTIVE);
 	}
 	
 	void MoveCamera(float xPos, float zPos, float camHeight, bool camHeightAbsolute)
