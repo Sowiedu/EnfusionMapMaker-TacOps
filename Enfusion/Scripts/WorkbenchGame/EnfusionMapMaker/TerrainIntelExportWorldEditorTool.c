@@ -632,8 +632,8 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		string name = entity.GetName();
 		string typeName = typename.EnumToString(EMapDescriptorType, baseType);
 
-		// Escape quotes in name for JSON safety
-		name.Replace("\"", "\\\"");
+		// Strip quotes from name for JSON safety (Enforce Script has limited escape support)
+		name.Replace("\"", "");
 
 		float elevation = api.GetTerrainSurfaceY(pos[0], pos[2]);
 
