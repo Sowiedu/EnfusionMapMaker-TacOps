@@ -1,6 +1,6 @@
 [WorkbenchToolAttribute(
 	name: "Terrain Intel Export",
-	description: "Export terrain intelligence data (heightmap, roads, forests, water, landmarks, metadata) for TacOps.",
+	description: "Export terrain intelligence data (heightmap, roads, forests, water, landmarks, metadata, trees, buildings) for TacOps.",
 	wbModules: {"WorldEditor"},
 	awesomeFontCode: 0xf0ac)]
 class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
@@ -13,6 +13,8 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	//   - water.geojson                        (lakes as Polygons, rivers as LineStrings, ocean metadata)
 	//   - landmarks.geojson                    (POIs from MapDescriptorComponent as Points)
 	//   - terrain_meta.json                    (comprehensive terrain metadata)
+	//   - trees.bin                            (per-tree positions + bounding boxes, binary float32)
+	//   - buildings.bin                         (per-building AABB footprints + top height, binary float32)
 
 	//------------------------------------------------------------
 	// State
@@ -34,6 +36,12 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	private int m_LakeCount;
 	private int m_RiverCount;
 	private int m_LandmarkCount;
+
+	// Surface object export state (used by streaming callbacks)
+	private FileHandle m_TreeFile;
+	private int m_TreeCount;
+	private FileHandle m_BuildingFile;
+	private int m_BuildingCount;
 
 	//------------------------------------------------------------
 	// Shared: Initialization
@@ -738,6 +746,175 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	}
 
 	//------------------------------------------------------------
+	// Layer 6: Tree Export (runtime entity query)
+	//------------------------------------------------------------
+
+	//! Export all standing tree entities as a compact binary file.
+	//! Uses BaseWorld.QueryEntitiesByAABB with a streaming callback
+	//! to avoid building a massive intermediate array.
+	//!
+	//! Format: 8-byte header (uint32 count + uint32 reserved)
+	//!         + N * 16-byte records (float32 posX, posZ, height, radius)
+	private void ExportTrees()
+	{
+		WorldEditorAPI api = GetApi();
+		BaseWorld world = api.GetWorld();
+		if (!world)
+		{
+			Print("ERROR: No world available for tree export");
+			return;
+		}
+
+		vector worldMins, worldMaxs;
+		world.GetBoundBox(worldMins, worldMaxs);
+
+		string path = m_OutputDir + "/trees.bin";
+		m_TreeFile = SafeOpenFile(path);
+		if (!m_TreeFile)
+			return;
+
+		m_TreeCount = 0;
+
+		// Write placeholder header — we'll seek back to update the count
+		array<int> header = {0, 0};
+		m_TreeFile.WriteArray(header, 4, 2);
+
+		Print("  Scanning world for tree entities...");
+
+		// Query static entities only — trees are never dynamic
+		world.QueryEntitiesByAABB(worldMins, worldMaxs, OnTreeEntityFound, null, EQueryEntitiesFlags.STATIC);
+
+		// Seek back and write actual count in the header
+		m_TreeFile.Seek(0);
+		header[0] = m_TreeCount;
+		m_TreeFile.WriteArray(header, 4, 2);
+		m_TreeFile.Close();
+		m_TreeFile = null;
+
+		PrintFormat("  Trees: %1 entities → trees.bin", m_TreeCount);
+	}
+
+	//! Callback for tree entity query. Returns true to continue, false to stop.
+	private bool OnTreeEntityFound(IEntity ent)
+	{
+		if (IsCancelled())
+			return false;
+
+		// Skip tree parts (sub-components of destructible trees)
+		if (ent.IsInherited(SCR_TreePartV2))
+			return true;
+
+		// Skip fallen trees (lie horizontal, don't block LOS)
+		if (ent.IsInherited(FallenTree))
+			return true;
+
+		// Match standing trees and forest generator trees
+		bool isTree = ent.IsInherited(Tree) || ent.IsInherited(ForestGeneratorTree);
+		// Also match cluster vegetation objects
+		isTree = isTree || ent.IsInherited(SmallForestGeneratorClusterObject);
+
+		if (!isTree)
+			return true;
+
+		vector mins, maxs;
+		ent.GetBounds(mins, maxs);
+
+		float height = maxs[1] - mins[1];
+		if (height < 1.0)
+			return true;  // skip ground debris / saplings
+
+		float posX = (mins[0] + maxs[0]) * 0.5;
+		float posZ = (mins[2] + maxs[2]) * 0.5;
+		float radius = Math.Max(maxs[0] - mins[0], maxs[2] - mins[2]) * 0.5;
+
+		array<float> record = {posX, posZ, height, radius};
+		m_TreeFile.WriteArray(record, 4, 4);
+		m_TreeCount++;
+
+		// Progress reporting every 10000 trees
+		if (m_TreeCount % 10000 == 0)
+			PrintFormat("    ... %1 trees found so far", m_TreeCount);
+
+		return true;
+	}
+
+	//------------------------------------------------------------
+	// Layer 7: Building Export (runtime entity query)
+	//------------------------------------------------------------
+
+	//! Export all building entities as a compact binary file.
+	//! Uses the same streaming callback pattern as tree export.
+	//!
+	//! Format: 8-byte header (uint32 count + uint32 reserved)
+	//!         + N * 20-byte records (float32 minX, minZ, maxX, maxZ, topY)
+	private void ExportBuildings()
+	{
+		WorldEditorAPI api = GetApi();
+		BaseWorld world = api.GetWorld();
+		if (!world)
+		{
+			Print("ERROR: No world available for building export");
+			return;
+		}
+
+		vector worldMins, worldMaxs;
+		world.GetBoundBox(worldMins, worldMaxs);
+
+		string path = m_OutputDir + "/buildings.bin";
+		m_BuildingFile = SafeOpenFile(path);
+		if (!m_BuildingFile)
+			return;
+
+		m_BuildingCount = 0;
+
+		// Write placeholder header
+		array<int> header = {0, 0};
+		m_BuildingFile.WriteArray(header, 4, 2);
+
+		Print("  Scanning world for building entities...");
+
+		world.QueryEntitiesByAABB(worldMins, worldMaxs, OnBuildingEntityFound, null, EQueryEntitiesFlags.STATIC);
+
+		// Write actual count
+		m_BuildingFile.Seek(0);
+		header[0] = m_BuildingCount;
+		m_BuildingFile.WriteArray(header, 4, 2);
+		m_BuildingFile.Close();
+		m_BuildingFile = null;
+
+		PrintFormat("  Buildings: %1 entities → buildings.bin", m_BuildingCount);
+	}
+
+	//! Callback for building entity query.
+	private bool OnBuildingEntityFound(IEntity ent)
+	{
+		if (IsCancelled())
+			return false;
+
+		// Match Building class specifically (not BaseBuilding — that includes
+		// SCR_BuildingRegionEntity, SCR_FiringRangeTarget, SCR_FragmentEntity)
+		if (!ent.IsInherited(Building))
+			return true;
+
+		vector mins, maxs;
+		ent.GetBounds(mins, maxs);
+
+		float height = maxs[1] - mins[1];
+		if (height < 1.0)
+			return true;  // skip very small structures
+
+		// Building record: AABB footprint + absolute top Y
+		array<float> record = {mins[0], mins[2], maxs[0], maxs[2], maxs[1]};
+		m_BuildingFile.WriteArray(record, 4, 5);
+		m_BuildingCount++;
+
+		if (m_BuildingCount % 1000 == 0)
+			PrintFormat("    ... %1 buildings found so far", m_BuildingCount);
+
+		return true;
+	}
+
+	//------------------------------------------------------------
 	// Buttons
 	//------------------------------------------------------------
 
@@ -761,6 +938,14 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		// Layer 5: Metadata
 		if (!IsCancelled())
 			ExportMetadata();
+
+		// Layer 6: Trees (runtime entity query)
+		if (!IsCancelled())
+			ExportTrees();
+
+		// Layer 7: Buildings (runtime entity query)
+		if (!IsCancelled())
+			ExportBuildings();
 
 		PrintFormat("=== Export Complete ===");
 		FinishExport();
@@ -829,6 +1014,28 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 		PrintFormat("=== Metadata Export: %1 ===", m_MapName);
 		ExportMetadata();
+		FinishExport();
+	}
+
+	[ButtonAttribute("Export Trees")]
+	void BtnExportTrees()
+	{
+		if (!InitExport())
+			return;
+
+		PrintFormat("=== Trees Export: %1 ===", m_MapName);
+		ExportTrees();
+		FinishExport();
+	}
+
+	[ButtonAttribute("Export Buildings")]
+	void BtnExportBuildings()
+	{
+		if (!InitExport())
+			return;
+
+		PrintFormat("=== Buildings Export: %1 ===", m_MapName);
+		ExportBuildings();
 		FinishExport();
 	}
 
