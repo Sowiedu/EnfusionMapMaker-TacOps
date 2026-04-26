@@ -43,6 +43,9 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	private FileHandle m_BuildingFile;
 	private int m_BuildingCount;
 
+	// Shape extraction state
+	private bool m_LastShapeClosed;
+
 	//------------------------------------------------------------
 	// Shared: Initialization
 	//------------------------------------------------------------
@@ -138,12 +141,12 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	}
 
 	//! Write a LineString feature to a GeoJSON file
-	private void WriteLineStringFeature(FileHandle fh, ref bool firstFeature, array<vector> points, string propsJson)
+	private void WriteLineStringFeature(FileHandle fh, bool firstFeature, array<vector> points, string propsJson)
 	{
 		string prefix = "";
 		if (!firstFeature)
 			prefix = ",\n";
-		firstFeature = false;
+
 
 		string coordsStr = FormatCoordArray(points);
 		fh.WriteLine(prefix + "    {");
@@ -157,12 +160,12 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	}
 
 	//! Write a Polygon feature to a GeoJSON file
-	private void WritePolygonFeature(FileHandle fh, ref bool firstFeature, array<vector> points, string propsJson)
+	private void WritePolygonFeature(FileHandle fh, bool firstFeature, array<vector> points, string propsJson)
 	{
 		string prefix = "";
 		if (!firstFeature)
 			prefix = ",\n";
-		firstFeature = false;
+
 
 		// Ensure closure: first point == last point for GeoJSON polygons
 		if (points.Count() > 0)
@@ -185,12 +188,12 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	}
 
 	//! Write a Point feature to a GeoJSON file
-	private void WritePointFeature(FileHandle fh, ref bool firstFeature, vector pos, string propsJson)
+	private void WritePointFeature(FileHandle fh, bool firstFeature, vector pos, string propsJson)
 	{
 		string prefix = "";
 		if (!firstFeature)
 			prefix = ",\n";
-		firstFeature = false;
+
 
 		fh.WriteLine(prefix + "    {");
 		fh.WriteLine("      \"type\": \"Feature\",");
@@ -208,10 +211,10 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 	//! Extract world-space points from a parent shape entity source.
 	//! Returns false if the shape cannot be resolved.
-	private bool ExtractShapePoints(IEntitySource parentShapeSrc, out array<vector> points, out bool isClosed)
+	private bool ExtractShapePoints(IEntitySource parentShapeSrc, out array<vector> points)
 	{
 		points = {};
-		isClosed = false;
+		m_LastShapeClosed = false;
 
 		WorldEditorAPI api = GetApi();
 		IEntity ent = api.SourceToEntity(parentShapeSrc);
@@ -226,7 +229,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		}
 
 		shape.GenerateTesselatedShape(points);
-		isClosed = shape.IsClosed();
+		m_LastShapeClosed = shape.IsClosed();
 
 		// GenerateTesselatedShape returns points in local space; transform to world
 		vector mat[4];
@@ -451,6 +454,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 					string oceanProps = string.Format("\"type\": \"ocean\", \"baseHeight\": %1", oceanHeight);
 					// Ocean is a metadata-only point at origin
 					WritePointFeature(fhWater, m_WaterFirstFeature, vector.Zero, oceanProps);
+					m_WaterFirstFeature = false;
 				}
 			}
 		}
@@ -552,9 +556,8 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	private void CollectRoad(FileHandle fh, IEntitySource parentShapeSrc, IEntitySource roadGenSrc)
 	{
 		array<vector> points;
-		bool isClosed;
 
-		if (!ExtractShapePoints(parentShapeSrc, points, isClosed))
+		if (!ExtractShapePoints(parentShapeSrc, points))
 			return;
 
 		float roadWidth = 6.0;
@@ -562,33 +565,33 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 		string props = string.Format("\"type\": \"road\", \"width\": %1", roadWidth);
 		WriteLineStringFeature(fh, m_RoadsFirstFeature, points, props);
+		m_RoadsFirstFeature = false;
 		m_RoadCount++;
 	}
 
 	private void CollectForest(FileHandle fh, IEntitySource parentShapeSrc, IEntitySource forestGenSrc)
 	{
 		array<vector> points;
-		bool isClosed;
 
-		if (!ExtractShapePoints(parentShapeSrc, points, isClosed))
+		if (!ExtractShapePoints(parentShapeSrc, points))
 			return;
 
-		if (!isClosed)
+		if (!m_LastShapeClosed)
 		{
 			PrintFormat("WARNING: Forest shape is not closed, skipping");
 			return;
 		}
 
 		WritePolygonFeature(fh, m_ForestsFirstFeature, points, "\"type\": \"forest\"");
+		m_ForestsFirstFeature = false;
 		m_ForestCount++;
 	}
 
 	private void CollectLake(FileHandle fh, IEntitySource parentShapeSrc, IEntitySource lakeGenSrc)
 	{
 		array<vector> points;
-		bool isClosed;
 
-		if (!ExtractShapePoints(parentShapeSrc, points, isClosed))
+		if (!ExtractShapePoints(parentShapeSrc, points))
 			return;
 
 		// Derive surface Y from the average Y of shape points
@@ -602,15 +605,15 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 		string props = string.Format("\"type\": \"lake\", \"surfaceY\": %1", surfaceY);
 		WritePolygonFeature(fh, m_WaterFirstFeature, points, props);
+		m_WaterFirstFeature = false;
 		m_LakeCount++;
 	}
 
 	private void CollectRiver(FileHandle fh, IEntitySource parentShapeSrc, IEntitySource riverSrc)
 	{
 		array<vector> points;
-		bool isClosed;
 
-		if (!ExtractShapePoints(parentShapeSrc, points, isClosed))
+		if (!ExtractShapePoints(parentShapeSrc, points))
 			return;
 
 		float clearance = 10.0;
@@ -618,6 +621,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 		string props = string.Format("\"type\": \"river\", \"width\": %1", clearance);
 		WriteLineStringFeature(fh, m_WaterFirstFeature, points, props);
+		m_WaterFirstFeature = false;
 		m_RiverCount++;
 	}
 
@@ -650,6 +654,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 			typeName, baseType, name, elevation);
 
 		WritePointFeature(fh, m_LandmarksFirstFeature, pos, props);
+		m_LandmarksFirstFeature = false;
 		m_LandmarkCount++;
 	}
 
