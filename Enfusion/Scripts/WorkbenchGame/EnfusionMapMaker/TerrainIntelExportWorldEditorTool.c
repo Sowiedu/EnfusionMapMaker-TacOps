@@ -13,8 +13,8 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	//   - water.geojson                        (lakes as Polygons, rivers as LineStrings, ocean metadata)
 	//   - landmarks.geojson                    (POIs from MapDescriptorComponent as Points)
 	//   - terrain_meta.json                    (comprehensive terrain metadata)
-	//   - trees.bin                            (per-tree positions + bounding boxes, binary float32)
-	//   - buildings.bin                         (per-building AABB footprints + top height, binary float32)
+	//   - trees.bin                            (per-tree world-space positions + bounding, binary float32, count = file_size / 16)
+	//   - buildings.bin                         (per-building world-space AABB footprints + top, binary float32, count = file_size / 20)
 
 	//------------------------------------------------------------
 	// State
@@ -38,10 +38,12 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	private int m_LandmarkCount;
 
 	// Surface object export state (used by streaming callbacks)
-	private FileHandle m_TreeFile;
+	// Callbacks collect data into arrays; files are written AFTER the query returns.
+	// (QueryEntitiesByAABB invalidates FileHandle member variables during callbacks)
 	private int m_TreeCount;
-	private FileHandle m_BuildingFile;
 	private int m_BuildingCount;
+	private ref array<float> m_TreeData;      // flat: posX, posZ, height, radius per tree
+	private ref array<float> m_BuildingData;   // flat: minX, minZ, maxX, maxZ, topY per building
 
 	// Shape extraction state
 	private bool m_LastShapeClosed;
@@ -90,6 +92,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	{
 		EndOperation();
 	}
+
 
 	//------------------------------------------------------------
 	// Shared: File I/O
@@ -477,6 +480,9 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		int entityCount = api.GetEditorEntityCount();
 		PrintFormat("  Scanning %1 editor entities ...", entityCount);
 
+		int entitiesWithChildren = 0;
+		int totalChildren = 0;
+
 		for (int i = 0; i < entityCount; i++)
 		{
 			if (IsCancelled())
@@ -490,6 +496,11 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 			if (doRoads || doForests || doWater)
 			{
 				int childCount = entSrc.GetNumChildren();
+				if (childCount > 0)
+				{
+					entitiesWithChildren++;
+					totalChildren += childCount;
+				}
 				for (int c = 0; c < childCount; c++)
 				{
 					IEntitySource childSrc = entSrc.GetChild(c);
@@ -497,6 +508,10 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 						continue;
 
 					string childClass = childSrc.GetClassName();
+
+					// Log first few child class names to see what's in the world
+					if (totalChildren < 30)
+						PrintFormat("    Child[%1]: class=%2 (parent=%3)", c, childClass, entSrc.GetClassName());
 
 					if (doRoads && childClass == "RoadGeneratorEntity")
 						CollectRoad(fhRoads, entSrc, childSrc);
@@ -515,6 +530,8 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 
 			ReportProgress(i, entityCount, "Entity scan");
 		}
+
+		PrintFormat("  Scan complete: %1 entities with children, %2 total children", entitiesWithChildren, totalChildren);
 
 		// --- Close all files ---
 		if (doRoads && fhRoads)
@@ -755,11 +772,11 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	//------------------------------------------------------------
 
 	//! Export all standing tree entities as a compact binary file.
-	//! Uses BaseWorld.QueryEntitiesByAABB with a streaming callback
-	//! to avoid building a massive intermediate array.
+	//! Callbacks collect data into m_TreeData; file is written after the query.
+	//! (QueryEntitiesByAABB invalidates member FileHandle variables during callbacks)
 	//!
-	//! Format: 8-byte header (uint32 count + uint32 reserved)
-	//!         + N * 16-byte records (float32 posX, posZ, height, radius)
+	//! Format: N * 16-byte records (float32 posX, posZ, height, radius)
+	//! Reader derives count from file_size / 16.
 	private void ExportTrees()
 	{
 		WorldEditorAPI api = GetApi();
@@ -773,33 +790,35 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		vector worldMins, worldMaxs;
 		world.GetBoundBox(worldMins, worldMaxs);
 
-		string path = m_OutputDir + "/trees.bin";
-		m_TreeFile = SafeOpenFile(path);
-		if (!m_TreeFile)
-			return;
-
+		// Prepare collection array
 		m_TreeCount = 0;
-
-		// Write placeholder header — we'll seek back to update the count
-		array<int> header = {0, 0};
-		m_TreeFile.WriteArray(header, 4, 2);
+		m_TreeData = new array<float>();
 
 		Print("  Scanning world for tree entities...");
 
-		// Query static entities only — trees are never dynamic
+		// Query — callback only appends to m_TreeData, no file I/O
 		world.QueryEntitiesByAABB(worldMins, worldMaxs, OnTreeEntityFound, null, EQueryEntitiesFlags.STATIC);
 
-		// Seek back and write actual count in the header
-		m_TreeFile.Seek(0);
-		header[0] = m_TreeCount;
-		m_TreeFile.WriteArray(header, 4, 2);
-		m_TreeFile.Close();
-		m_TreeFile = null;
+		PrintFormat("  Query complete. Collected %1 trees (%2 floats).", m_TreeCount, m_TreeData.Count());
 
-		PrintFormat("  Trees: %1 entities → trees.bin", m_TreeCount);
+		// Now write everything to file at once
+		string path = m_OutputDir + "/trees.bin";
+		FileHandle fh = SafeOpenFile(path);
+		if (!fh)
+			return;
+
+		// Write all records — no footer; reader derives count from file_size / 16
+		if (m_TreeData.Count() > 0)
+			fh.WriteArray(m_TreeData, 4, m_TreeData.Count());
+		fh.Close();
+
+		PrintFormat("  Trees: %1 entities -> trees.bin", m_TreeCount);
+
+		// Free collection memory
+		m_TreeData = null;
 	}
 
-	//! Callback for tree entity query. Returns true to continue, false to stop.
+	//! Callback for tree entity query — collects data, no file I/O.
 	private bool OnTreeEntityFound(IEntity ent)
 	{
 		if (IsCancelled())
@@ -822,7 +841,7 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 			return true;
 
 		vector mins, maxs;
-		ent.GetBounds(mins, maxs);
+		ent.GetWorldBounds(mins, maxs);
 
 		float height = maxs[1] - mins[1];
 		if (height < 1.0)
@@ -832,8 +851,11 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		float posZ = (mins[2] + maxs[2]) * 0.5;
 		float radius = Math.Max(maxs[0] - mins[0], maxs[2] - mins[2]) * 0.5;
 
-		array<float> record = {posX, posZ, height, radius};
-		m_TreeFile.WriteArray(record, 4, 4);
+		// Collect into flat array — no file I/O here
+		m_TreeData.Insert(posX);
+		m_TreeData.Insert(posZ);
+		m_TreeData.Insert(height);
+		m_TreeData.Insert(radius);
 		m_TreeCount++;
 
 		// Progress reporting every 10000 trees
@@ -848,10 +870,10 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 	//------------------------------------------------------------
 
 	//! Export all building entities as a compact binary file.
-	//! Uses the same streaming callback pattern as tree export.
+	//! Same collect-then-write pattern as tree export.
 	//!
-	//! Format: 8-byte header (uint32 count + uint32 reserved)
-	//!         + N * 20-byte records (float32 minX, minZ, maxX, maxZ, topY)
+	//! Format: N * 20-byte records (float32 minX, minZ, maxX, maxZ, topY)
+	//! Reader derives count from file_size / 20.
 	private void ExportBuildings()
 	{
 		WorldEditorAPI api = GetApi();
@@ -865,32 +887,35 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 		vector worldMins, worldMaxs;
 		world.GetBoundBox(worldMins, worldMaxs);
 
-		string path = m_OutputDir + "/buildings.bin";
-		m_BuildingFile = SafeOpenFile(path);
-		if (!m_BuildingFile)
-			return;
-
+		// Prepare collection array
 		m_BuildingCount = 0;
-
-		// Write placeholder header
-		array<int> header = {0, 0};
-		m_BuildingFile.WriteArray(header, 4, 2);
+		m_BuildingData = new array<float>();
 
 		Print("  Scanning world for building entities...");
 
+		// Query — callback only appends to m_BuildingData, no file I/O
 		world.QueryEntitiesByAABB(worldMins, worldMaxs, OnBuildingEntityFound, null, EQueryEntitiesFlags.STATIC);
 
-		// Write actual count
-		m_BuildingFile.Seek(0);
-		header[0] = m_BuildingCount;
-		m_BuildingFile.WriteArray(header, 4, 2);
-		m_BuildingFile.Close();
-		m_BuildingFile = null;
+		PrintFormat("  Query complete. Collected %1 buildings (%2 floats).", m_BuildingCount, m_BuildingData.Count());
 
-		PrintFormat("  Buildings: %1 entities → buildings.bin", m_BuildingCount);
+		// Now write everything to file at once
+		string path = m_OutputDir + "/buildings.bin";
+		FileHandle fh = SafeOpenFile(path);
+		if (!fh)
+			return;
+
+		// Write all records — no footer; reader derives count from file_size / 20
+		if (m_BuildingData.Count() > 0)
+			fh.WriteArray(m_BuildingData, 4, m_BuildingData.Count());
+		fh.Close();
+
+		PrintFormat("  Buildings: %1 entities -> buildings.bin", m_BuildingCount);
+
+		// Free collection memory
+		m_BuildingData = null;
 	}
 
-	//! Callback for building entity query.
+	//! Callback for building entity query — collects data, no file I/O.
 	private bool OnBuildingEntityFound(IEntity ent)
 	{
 		if (IsCancelled())
@@ -902,15 +927,18 @@ class TerrainIntelExportWorldEditorTool: BaseMapMakerTool
 			return true;
 
 		vector mins, maxs;
-		ent.GetBounds(mins, maxs);
+		ent.GetWorldBounds(mins, maxs);
 
 		float height = maxs[1] - mins[1];
 		if (height < 1.0)
 			return true;  // skip very small structures
 
-		// Building record: AABB footprint + absolute top Y
-		array<float> record = {mins[0], mins[2], maxs[0], maxs[2], maxs[1]};
-		m_BuildingFile.WriteArray(record, 4, 5);
+		// Collect into flat array — no file I/O here
+		m_BuildingData.Insert(mins[0]);
+		m_BuildingData.Insert(mins[2]);
+		m_BuildingData.Insert(maxs[0]);
+		m_BuildingData.Insert(maxs[2]);
+		m_BuildingData.Insert(maxs[1]);
 		m_BuildingCount++;
 
 		if (m_BuildingCount % 1000 == 0)
